@@ -8,6 +8,7 @@ SOFT_MAX_RATIO_VAL = 10
 
 
 def list_gcd(data):
+    """Return greatest common divisor for all values in *data*."""
     lgcd = data[0]
     for i in range(1, len(data)):
         lgcd = math.gcd(lgcd, data[i])
@@ -15,6 +16,7 @@ def list_gcd(data):
 
 
 def get_iw_ratio(data, nodes, nid, soft_max=SOFT_MAX_RATIO_VAL):
+    """Return interleave weight ratio list for *nid* within *nodes*."""
     new_data = [0] * len(data)
     quit = False
 
@@ -42,6 +44,7 @@ def get_iw_ratio(data, nodes, nid, soft_max=SOFT_MAX_RATIO_VAL):
 
 
 def get_iw_ratio_matrix(bw_matrix, possible, nodes):
+    """Create a ratio matrix from bandwidth matrix."""
     ratio_matrix = [0] * len(bw_matrix)
 
     for nid in possible:

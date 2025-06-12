@@ -175,6 +175,7 @@ def generate_topology(possible, args):
 
 
 def display_multi_ratio(matrix, possible, nodes, args):
+    """Print interleave weights and optionally write them to sysfs."""
     print("Bandwidth ratio for all NUMA nodes")
 
     # Write interleave weight value into sysfs file.
@@ -203,9 +204,10 @@ def display_multi_ratio(matrix, possible, nodes, args):
                 )
                 sys.exit(-1)
             print(f"   echo {weights[i]} > {INTERLEAVE_WEIGHT_DIR}/node{nids[i]}")
-            filename = f"{INTERLEAVE_WEIGHT_DIR}/node{nids[i]}"
-            with open(filename, "w") as f:
-                f.write(f"{weights[i]}")
+            if not args.dry_run:
+                filename = f"{INTERLEAVE_WEIGHT_DIR}/node{nids[i]}"
+                with open(filename, "w") as f:
+                    f.write(f"{weights[i]}")
                 updated_files.append(filename)
 
 
@@ -244,6 +246,12 @@ def main():
         required=False,
         help="topology structure",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without writing values to sysfs",
+    )
+
     args = parser.parse_args()
 
     check_sysfs()
