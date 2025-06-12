@@ -2,91 +2,24 @@
 # Copyright (c) 2023-2024 SK hynix, Inc.
 # SPDX-License-Identifier: BSD 2-Clause
 
-import argparse
 import json
 import os
-import subprocess as sp
 import sys
 
 import yaml
 
-# common options
-monitoring_intervals = "--monitoring_intervals 100ms 2s 20s"
-monitoring_nr_regions_range = "--monitoring_nr_regions_range 100 10000"
-
-# common damos options
-damos_sz_region = "--damos_sz_region 4096 max"
-damos_filter = "--damos_filter memcg nomatching /hmsdk"
-
-
-def parse_argument():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-d",
-        "--demote",
-        dest="migrate_cold",
-        action="append",
-        nargs=2,
-        metavar=("SRC", "DEST"),
-        default=[],
-        help="source and destination NUMA nodes for demotion.",
-    )
-    parser.add_argument(
-        "-p",
-        "--promote",
-        dest="migrate_hot",
-        action="append",
-        nargs=2,
-        metavar=("SRC", "DEST"),
-        default=[],
-        help="source and destination NUMA nodes for promotion.",
-    )
-    parser.add_argument(
-        "-g",
-        "--global",
-        dest="nofilter",
-        action="store_true",
-        help="Apply tiered migration schemes globally not limited to PIDs under 'hmsdk' cgroup.",
-    )
-    parser.add_argument(
-        "-o", "--output", dest="output", default=None, help="Set the output json file."
-    )
-    return parser.parse_args()
+from gen_common import (
+    CheckNodes,
+    monitoring_intervals,
+    monitoring_nr_regions_range,
+    damos_sz_region,
+    damos_filter,
+    parse_argument,
+    parent_dir_of_file,
+    run_command,
+)
 
 
-def run_command(cmd):
-    with sp.Popen(cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE) as p:
-        stdout, stderr = p.communicate()
-        stdout_lines = stdout.decode(errors="ignore")
-        stderr_lines = stderr.decode(errors="ignore")
-        if len(stderr_lines) > 0:
-            print(stderr_lines)
-        return stdout_lines
-
-
-def parent_dir_of_file(file):
-    return os.path.dirname(os.path.dirname(os.path.abspath(file)))
-
-
-class CheckNodes:
-    def __init__(self):
-        self.handled_node = set()
-
-    def __call__(self, src_node, dest_node, node_json):
-        if src_node in self.handled_node:
-            return f"node {src_node} cannot be used multiple times for source node"
-        self.handled_node.add(src_node)
-
-        if src_node == dest_node:
-            return f"node {src_node} cannot be used for both SRC and DEST node"
-
-        nr_regions = len(
-            node_json["kdamonds"][0]["contexts"][0]["targets"][0]["regions"]
-        )
-        if nr_regions <= 0:
-            return f"node {src_node} has no valid regions"
-
-        return None
 
 
 def main():
