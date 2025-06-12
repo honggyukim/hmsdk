@@ -55,13 +55,12 @@ def parse_argument():
 
 
 def run_command(cmd):
-    with sp.Popen(cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE) as p:
-        stdout, stderr = p.communicate()
-        stdout_lines = stdout.decode(errors="ignore")
-        stderr_lines = stderr.decode(errors="ignore")
-        if len(stderr_lines) > 0:
-            print(stderr_lines)
-        return stdout_lines
+    """Run *cmd* and return stdout as string."""
+    completed = sp.run(cmd.split(), stdout=sp.PIPE, stderr=sp.PIPE, text=True)
+    if completed.stderr:
+        print(completed.stderr)
+    completed.check_returncode()
+    return completed.stdout
 
 
 def parent_dir_of_file(file):
