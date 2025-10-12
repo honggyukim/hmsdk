@@ -61,10 +61,16 @@ struct Options {
 
     // 2D graph mode
     bool graph2d = false;     // enable 2D graph (x=time, y=usage in GB)
-    int  graph_width = 90;    // DEFAULT changed to 90 columns
+    int  graph_width = 90;    // DEFAULT 90 columns
     int  graph_height = 10;   // rows (for the largest node); each row has 5 sub-steps
     bool graph_legend = true;
     bool scale_by_total = false; // scale each node's height by its total memory
+
+    // CSV logging
+    std::string csv_path;     // empty => disabled
+    bool csv_append = false;
+    bool csv_no_header = false;
+    bool csv_wide = false;    // NEW: sample-per-row (wide) mode
 } g_opt;
 
 // node -> history (length <= graph_width)
@@ -188,6 +194,90 @@ static int term_width() {
     return 100;
 }
 
+// ---------------- CSV helpers ----------------
+static bool file_exists_and_nonempty(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    f.seekg(0, std::ios::end);
+    return f.tellg() > 0;
+}
+
+// narrow header: one row per node
+static void csv_write_header_narrow(std::ofstream& ofs) {
+    ofs << "timestamp,node,total_bytes,used_bytes,free_bytes,used_pct,"
+           "anon_bytes,file_bytes,slab_bytes,shmem_bytes\n";
+}
+
+static void csv_write_rows_narrow(std::ofstream& ofs, const std::vector<NodeStat>& stats) {
+    std::string ts = now_string();
+    for (const auto& s : stats) {
+        long long anon_b = s.extra.anon_bytes >= 0 ? s.extra.anon_bytes : 0;
+        long long file_b = s.extra.file_bytes >= 0 ? s.extra.file_bytes : 0;
+        long long slab_b = s.extra.slab_bytes >= 0 ? s.extra.slab_bytes : 0;
+        long long shmem_b= s.extra.shmem_bytes>= 0 ? s.extra.shmem_bytes: 0;
+        ofs << ts << ','
+            << s.node << ','
+            << s.total << ','
+            << s.used << ','
+            << s.free << ','
+            << std::fixed << std::setprecision(2) << s.used_pct << ','
+            << anon_b << ','
+            << file_b << ','
+            << slab_b << ','
+            << shmem_b << '\n';
+    }
+    ofs.flush();
+}
+
+// wide header: one row per sample (all nodes in one line)
+static void csv_write_header_wide(std::ofstream& ofs, const std::vector<int>& nodes) {
+    ofs << "timestamp";
+    for (int n : nodes) {
+        ofs << ",node" << n << "_total_bytes"
+            << ",node" << n << "_used_bytes"
+            << ",node" << n << "_free_bytes"
+            << ",node" << n << "_used_pct"
+            << ",node" << n << "_anon_bytes"
+            << ",node" << n << "_file_bytes"
+            << ",node" << n << "_slab_bytes"
+            << ",node" << n << "_shmem_bytes";
+    }
+    ofs << "\n";
+}
+
+static void csv_write_row_wide(std::ofstream& ofs, const std::vector<NodeStat>& stats, const std::vector<int>& nodes) {
+    std::string ts = now_string();
+    ofs << ts;
+
+    // Build map: node -> stat
+    std::map<int, const NodeStat*> by_node;
+    for (const auto& s : stats) by_node[s.node] = &s;
+
+    for (int n : nodes) {
+        auto it = by_node.find(n);
+        if (it == by_node.end()) {
+            // Node missing: write empty fields
+            ofs << ",,,,,,,,";
+        } else {
+            const NodeStat& s = *it->second;
+            long long anon_b = s.extra.anon_bytes >= 0 ? s.extra.anon_bytes : 0;
+            long long file_b = s.extra.file_bytes >= 0 ? s.extra.file_bytes : 0;
+            long long slab_b = s.extra.slab_bytes >= 0 ? s.extra.slab_bytes : 0;
+            long long shmem_b= s.extra.shmem_bytes>= 0 ? s.extra.shmem_bytes: 0;
+            ofs << ',' << s.total
+                << ',' << s.used
+                << ',' << s.free
+                << ',' << std::fixed << std::setprecision(2) << s.used_pct
+                << ',' << anon_b
+                << ',' << file_b
+                << ',' << slab_b
+                << ',' << shmem_b;
+        }
+    }
+    ofs << "\n";
+    ofs.flush();
+}
+
 // ---------------- table printer ----------------
 static void print_table(const std::vector<NodeStat>& stats) {
     auto now = now_string();
@@ -240,7 +330,7 @@ static void print_table(const std::vector<NodeStat>& stats) {
     std::cout.flush();
 }
 
-// ---------------- 2D graph helpers ----------------
+// ---------------- graph helpers (unchanged from v2.0) ----------------
 static int effective_height_for_node(long long node_total, long long max_total) {
     if (!g_opt.scale_by_total || max_total <= 0) return g_opt.graph_height;
     double ratio = static_cast<double>(node_total) / static_cast<double>(max_total);
@@ -248,10 +338,7 @@ static int effective_height_for_node(long long node_total, long long max_total) 
     if (h < 2) h = 2;
     return h;
 }
-
-// choose a "nice" tick step (in seconds) to draw ~4..8 labels
 static int choose_tick_step_secs(int total_span_secs) {
-    // common "nice" steps in seconds
     static const int CAND[] = {
         5, 10, 15, 20, 30,
         60, 120, 180, 300, 600,
@@ -261,17 +348,22 @@ static int choose_tick_step_secs(int total_span_secs) {
         int ticks = (total_span_secs >= step) ? (total_span_secs / step) : 0;
         if (ticks >= 4 && ticks <= 8) return step;
     }
-    // fallback: if very short or very long, pick a step to keep ≤ 10 ticks
     int step = std::max(1, total_span_secs / 8);
-    // round step to nearest 5s for readability
     step = ((step + 4) / 5) * 5;
     if (step == 0) step = 1;
     return step;
 }
+static const char* color_anon_file_other_by_ratio(double t_in_used, double anon_frac, double file_frac, bool use_color) {
+    if (!use_color) return "";
+    static const char* C_ANON = "\033[32m";
+    static const char* C_FILE = "\033[33m";
+    static const char* C_OTHR = "\033[34m";
+    if (t_in_used <= anon_frac + 1e-9) return C_ANON;
+    if (t_in_used <= anon_frac + file_frac + 1e-9) return C_FILE;
+    return C_OTHR;
+}
 
-// ---------------- 2D graph printer ----------------
-// x=time (left→right), y is normalized 0..1 of TOTAL (internally H*5 steps).
-// Coloring uses each column's own used% and anon/file fractions recorded at sampling time.
+// ---------------- 2D graph printer (abridged: identical to v2.0 except x-label line placement) ----------------
 static void print_graph2d_for_node(
     int n, int H, const NodeStat& s_latest, const std::deque<HistSample>& hist
 ) {
@@ -291,7 +383,7 @@ static void print_graph2d_for_node(
             anon_frac[x] = file_frac[x] = 0.0;
         } else {
             const HistSample& hs = hist[x - pad];
-            double u = std::max(0.0, std::min(100.0, hs.used_pct)) / 100.0; // used fraction of total
+            double u = std::max(0.0, std::min(100.0, hs.used_pct)) / 100.0;
             int steps = (int)std::round(u * steps_total);
             used_steps[x] = clampi(steps, 0, steps_total);
             anon_frac[x]  = std::max(0.0, std::min(1.0, hs.anon_frac_used));
@@ -304,7 +396,6 @@ static void print_graph2d_for_node(
         }
     }
 
-    // Header
     std::cout << "Node " << n
               << "  (" << std::fixed << std::setprecision(1) << s_latest.used_pct << "%, "
               << "H=" << H << ", "
@@ -313,7 +404,6 @@ static void print_graph2d_for_node(
               << "Free="  << std::fixed << std::setprecision(2) << toGB(s_latest.free)  << " GB"
               << ")\n";
 
-    // Y labels (in GB for the latest total)
     double total_gb = toGB(s_latest.total);
     double mid_gb   = total_gb / 2.0;
 
@@ -328,12 +418,12 @@ static void print_graph2d_for_node(
             int rem  = used_steps_col - base;
             if (rem < 0) rem = 0;
             if (rem > 5) rem = 5;
-            return rem; // 0..5
+            return rem;
         };
         auto step4 = [](int f)->int{
             if (f <= 0) return 0;
             if (f >= 5) return 4;
-            return f; // 1..4
+            return f;
         };
 
         for (int x = 0; x < g_opt.graph_width; ++x) {
@@ -347,41 +437,29 @@ static void print_graph2d_for_node(
             int sp = step4(fp);
             const char* sym = pick_symbol_up(sp, sc);
 
-            if (sc == 0) { // nothing in this cell (space)
+            if (sc == 0) {
                 std::cout << sym;
                 continue;
             }
 
-            // position inside USED (0..1) for this column, using top of this cell
             int level_steps = row*5 + std::min(fc, 5);
             double t_in_used = (uc > 0) ? (double)level_steps / (double)uc : 0.0;
             if (t_in_used < 0.0) t_in_used = 0.0;
             if (t_in_used > 1.0) t_in_used = 1.0;
 
-            // Colors: bottom→top inside USED = Anon(green), File(yellow), Other(blue)
-            const char* col =
-                ( !g_opt.use_color ? "" :
-                  (t_in_used <= anon_frac[x] + 1e-9) ? "\033[32m" :
-                  (t_in_used <= anon_frac[x] + file_frac[x] + 1e-9) ? "\033[33m" :
-                  "\033[34m" );
-
+            const char* col = color_anon_file_other_by_ratio(t_in_used, anon_frac[x], file_frac[x], g_opt.use_color);
             std::cout << col << sym << CLR_RESET(g_opt.use_color);
         }
         std::cout << "\n";
     }
 
-    // --- X-axis line (dashes) ---
+    // X-axis and labels on the next line
     std::string axis(g_opt.graph_width, '-');
-    // total time span covered (approx)
     int total_span_secs = (g_opt.graph_width - 1) * g_opt.interval;
     int step_secs = choose_tick_step_secs(total_span_secs);
-
     std::cout << "         +" << axis << "→ time\n";
 
-    // --- Next line: relative time labels (e.g., -30s, -1m) ---
-    // Build a blank label line and place labels at appropriate columns.
     std::string labels(g_opt.graph_width, ' ');
-
     auto place_label = [&](int col_index_from_left, const std::string& txt){
         if (col_index_from_left < 0 || col_index_from_left >= (int)labels.size()) return;
         int start = col_index_from_left - (int)txt.size()/2;
@@ -391,23 +469,16 @@ static void print_graph2d_for_node(
         for (size_t i=0; i<txt.size(); ++i)
             labels[start + (int)i] = txt[i];
     };
-
-    // Rightmost column is "now". Label negative seconds moving left on the next line.
     for (int age = step_secs; age <= total_span_secs; age += step_secs) {
-        int pos_from_right = age / g_opt.interval;                 // columns to the left of "now"
-        int col_left = g_opt.graph_width - 1 - pos_from_right;     // 0..width-1 from left
+        int pos_from_right = age / g_opt.interval;
+        int col_left = g_opt.graph_width - 1 - pos_from_right;
         if (col_left < 0) break;
-
-        // Prefer minutes label if divisible by 60, else seconds
-        std::string label;
-        if (age >= 60 && age % 60 == 0) label = "-" + std::to_string(age/60) + "m";
-        else                             label = "-" + std::to_string(age)    + "s";
+        std::string label = (age >= 60 && age % 60 == 0)
+                            ? "-" + std::to_string(age/60) + "m"
+                            : "-" + std::to_string(age) + "s";
         place_label(col_left, label);
     }
-    // Optional: mark "now" at the rightmost edge
     place_label(g_opt.graph_width - 1, "now");
-
-    // Align labels under the dashes (one extra space to skip the '+')
     std::cout << "          " << labels << "\n\n";
 }
 
@@ -449,9 +520,9 @@ static void print_graph2d(const std::vector<int>& nodes,
 }
 
 // ---------------- argp ----------------
-const char *argp_program_version = "numa_mem_monitor 1.9.1";
+const char *argp_program_version = "numa_mem_monitor 2.1";
 const char *argp_program_bug_address = "<bugs@example.com>";
-static char doc[] = "Per-NUMA node memory usage monitor (libnuma, GNU argp) with 2D Unicode graph; per-node scaled height; headers with Total/Used/Free; y-axis in GB; fixed per-column coloring; x-axis width=90 with relative time labels";
+static char doc[] = "Per-NUMA node memory monitor with 2D Unicode graph and CSV logging (wide mode supported)";
 static char args_doc[] = "";
 
 enum {
@@ -468,7 +539,12 @@ enum {
     KEY_GRAPH_WIDTH,
     KEY_GRAPH_HEIGHT,
     KEY_NO_GRAPH_LEGEND,
-    KEY_SCALE_BY_TOTAL
+    KEY_SCALE_BY_TOTAL,
+    // CSV
+    KEY_CSV,
+    KEY_CSV_APPEND,
+    KEY_CSV_NO_HEADER,
+    KEY_CSV_WIDE
 };
 
 static struct argp_option options[] = {
@@ -487,6 +563,11 @@ static struct argp_option options[] = {
     {"graph-height",   KEY_GRAPH_HEIGHT, "N",  0, "Graph base height (rows for largest node, default 10)"},
     {"scale-by-total", KEY_SCALE_BY_TOTAL,0,   0, "Scale each node's height by its total memory"},
     {"no-graph-legend",KEY_NO_GRAPH_LEGEND,0,  0, "Hide graph legend"},
+    // CSV
+    {"csv",            KEY_CSV,          "PATH", 0, "Write snapshots to CSV at PATH"},
+    {"csv-append",     KEY_CSV_APPEND,    0,     0, "Append to CSV if it exists"},
+    {"csv-no-header",  KEY_CSV_NO_HEADER, 0,     0, "Do not write CSV header row"},
+    {"csv-wide",       KEY_CSV_WIDE,      0,     0, "Write one CSV row per sample (all nodes in one line)"},
     {0}
 };
 
@@ -517,6 +598,11 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state) {
         case KEY_GRAPH_HEIGHT: g_opt.graph_height = std::max(2, atoi(arg?arg:"10")); break;
         case KEY_SCALE_BY_TOTAL: g_opt.scale_by_total = true; break;
         case KEY_NO_GRAPH_LEGEND: g_opt.graph_legend = false; break;
+        // CSV
+        case KEY_CSV: g_opt.csv_path = arg ? std::string(arg) : std::string(); break;
+        case KEY_CSV_APPEND: g_opt.csv_append = true; break;
+        case KEY_CSV_NO_HEADER: g_opt.csv_no_header = true; break;
+        case KEY_CSV_WIDE: g_opt.csv_wide = true; break;
         case ARGP_KEY_ARG: argp_usage(state); break; // no positional args
         default: return ARGP_ERR_UNKNOWN;
     }
@@ -534,7 +620,7 @@ int main(int argc, char** argv) {
     }
     std::signal(SIGINT, handle_sigint);
 
-    // Discover and filter nodes
+    // Discover and filter nodes (this order defines the CSV-wide header order)
     std::vector<int> online = detect_online_nodes();
     if (online.empty()) { std::cerr << "No online NUMA nodes found.\n"; return 1; }
 
@@ -547,13 +633,34 @@ int main(int argc, char** argv) {
         if (nodes.empty()) { std::cerr << "No matching nodes online.\n"; return 1; }
     }
 
+    // CSV setup
+    std::ofstream csv_ofs;
+    bool csv_enabled = !g_opt.csv_path.empty();
+    if (csv_enabled) {
+        std::ios::openmode mode = std::ios::out;
+        if (g_opt.csv_append) mode |= std::ios::app;
+        csv_ofs.open(g_opt.csv_path, mode);
+        if (!csv_ofs.is_open()) {
+            std::cerr << "Failed to open CSV path: " << g_opt.csv_path << "\n";
+            return 1;
+        }
+        bool need_header = !g_opt.csv_no_header;
+        if (g_opt.csv_append && file_exists_and_nonempty(g_opt.csv_path)) {
+            need_header = false;
+        }
+        if (need_header) {
+            if (g_opt.csv_wide) csv_write_header_wide(csv_ofs, nodes);
+            else                csv_write_header_narrow(csv_ofs);
+        }
+    }
+
     do {
-        // Snapshot (need details in graph2d to compute fractions)
-        bool need_details = g_opt.details || g_opt.graph2d;
+        // Snapshot (need details in graph2d OR CSV to get anon/file/slab/shmem)
+        bool need_details = g_opt.details || g_opt.graph2d || csv_enabled;
         auto stats = snapshot_nodes(nodes, /*details*/ need_details);
         sort_stats(stats, g_opt.sort_key);
 
-        // Update history from this snapshot
+        // Update history from this snapshot (for graph2d)
         std::map<int, NodeStat> latest_by_node;
         for (const auto& s : stats) {
             latest_by_node[s.node] = s;
@@ -568,7 +675,6 @@ int main(int argc, char** argv) {
                 anon_gb = (ex.anon_bytes >= 0) ? toGB(ex.anon_bytes) : 0.0;
                 file_gb = (ex.file_bytes >= 0) ? toGB(ex.file_bytes) : 0.0;
             }
-            // clamp to used
             if (anon_gb < 0) anon_gb = 0;
             if (file_gb < 0) file_gb = 0;
             if (anon_gb > used_gb) anon_gb = used_gb;
@@ -589,7 +695,13 @@ int main(int argc, char** argv) {
             if ((int)dq.size() > g_opt.graph_width) dq.pop_front();
         }
 
-        // Render
+        // CSV: write snapshot
+        if (csv_enabled) {
+            if (g_opt.csv_wide) csv_write_row_wide(csv_ofs, stats, nodes);
+            else                csv_write_rows_narrow(csv_ofs, stats);
+        }
+
+        // Render to terminal
         if (g_opt.graph2d) {
             print_graph2d(nodes, latest_by_node);
         } else {
