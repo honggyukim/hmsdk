@@ -26,6 +26,7 @@
 static volatile sig_atomic_t g_stop = 0;
 void handle_sigint(int){ g_stop = 1; }
 
+// ---------- data models ----------
 struct NodeExtra {
     long long anon_bytes = -1, file_bytes = -1, slab_bytes = -1, shmem_bytes = -1;
 };
@@ -34,6 +35,13 @@ struct NodeStat {
     long long total = 0, free = 0, used = 0;
     double used_pct = 0.0;
     NodeExtra extra;
+};
+
+// Per-column historical sample (frozen at sampling time)
+struct HistSample {
+    double used_pct;          // used / total in [0..100]
+    double anon_frac_used;    // anon / used in [0..1]
+    double file_frac_used;    // file / used in [0..1]
 };
 
 struct Options {
@@ -52,17 +60,17 @@ struct Options {
     std::vector<int> filter_nodes;
 
     // 2D graph mode
-    bool graph2d = false;     // enable 2D graph (x=time, y=usage)
+    bool graph2d = false;     // enable 2D graph (x=time, y=usage in GB)
     int  graph_width = 80;    // columns (time)
     int  graph_height = 10;   // rows (for the largest node); each row has 5 sub-steps
     bool graph_legend = true;
     bool scale_by_total = false; // scale each node's height by its total memory
 } g_opt;
 
-// node -> history of usage (%) length <= graph_width
-static std::map<int, std::deque<double>> g_hist;
+// node -> history (length <= graph_width)
+static std::map<int, std::deque<HistSample>> g_hist;
 
-// -------- nvitop-style UP symbol table (no DOWN table) --------
+// -------- nvitop-style UP symbol table --------
 static const char* VALUE2SYMBOL_UP[5][5] = {
     /*prev=0*/ {" ", "⢀", "⢠", "⢰", "⢸"},
     /*prev=1*/ {"⡀","⣀","⣠","⣰","⣸"},
@@ -76,7 +84,7 @@ static inline const char* pick_symbol_up(int prev4, int curr4) {
     return VALUE2SYMBOL_UP[prev4][curr4];
 }
 
-// ---------------- Utils ----------------
+// ---------------- utils ----------------
 static std::string now_string() {
     using namespace std::chrono;
     auto t = system_clock::to_time_t(system_clock::now());
@@ -85,12 +93,6 @@ static std::string now_string() {
     char buf[64];
     strftime(buf, sizeof(buf), "%F %T", &tm);
     return buf;
-}
-static std::string color_for_usage(double pct, bool use_color) {
-    if (!use_color) return "";
-    if (pct < 50) return "\033[32m";   // green
-    if (pct < 80) return "\033[33m";   // yellow
-    return "\033[31m";                 // red
 }
 static const char* CLR_RESET(bool use_color){ return use_color ? "\033[0m" : ""; }
 static double toGB(long long bytes) { return bytes / (1024.0 * 1024.0 * 1024.0); }
@@ -186,11 +188,11 @@ static int term_width() {
     return 100;
 }
 
-// ---------------- Table printer ----------------
+// ---------------- table printer ----------------
 static void print_table(const std::vector<NodeStat>& stats) {
-    std::string ts = now_string();
+    auto now = now_string();
     if (g_opt.top_mode) std::cout << "\033[2J\033[H";
-    std::cout << "NUMA Node Memory Usage (table)   Time: " << ts << "\n";
+    std::cout << "NUMA Node Memory Usage (table)   Time: " << now << "\n";
     int barw = std::max(0, term_width() - 72);
     if (!g_opt.bars) barw = 0;
 
@@ -202,14 +204,20 @@ static void print_table(const std::vector<NodeStat>& stats) {
     std::cout << "\n";
 
     for (const auto& s : stats) {
-        std::string col = color_for_usage(s.used_pct, g_opt.use_color);
         const char* rst = CLR_RESET(g_opt.use_color);
+        double used_pct = s.used_pct;
+        std::string col;
+        if (g_opt.use_color) {
+            if (used_pct < 50) col = "\033[32m";
+            else if (used_pct < 80) col = "\033[33m";
+            else col = "\033[31m";
+        }
         printf(" %4d | %10.2f GB | %10.2f GB | %10.2f GB |  %s%6.2f%%%s",
                s.node, toGB(s.total), toGB(s.used), toGB(s.free),
-               col.c_str(), s.used_pct, rst);
+               col.c_str(), used_pct, rst);
         if (g_opt.bars) {
             int width = barw;
-            int filled = (int)((s.used_pct/100.0)*width + 0.5);
+            int filled = (int)((used_pct/100.0)*width + 0.5);
             if (filled<0) filled=0; if (filled>width) filled=width;
             std::cout << " | " << std::string(filled, '#') << std::string(width - filled, '-');
         }
@@ -237,45 +245,66 @@ static int effective_height_for_node(long long node_total, long long max_total) 
     if (!g_opt.scale_by_total || max_total <= 0) return g_opt.graph_height;
     double ratio = static_cast<double>(node_total) / static_cast<double>(max_total);
     int h = static_cast<int>(std::round(g_opt.graph_height * ratio));
-    if (h < 2) h = 2; // minimum readable height
+    if (h < 2) h = 2;
     return h;
 }
 
-static void print_graph2d_for_node(int n, int H, const NodeStat& s_latest) {
-    const auto &dq = g_hist[n];
+// pick color inside per-column used bands (bottom→top: Anon=green, File=yellow, Other=blue)
+static const char* color_anon_file_other_by_ratio(double t_in_used, double anon_frac, double file_frac, bool use_color) {
+    if (!use_color) return "";
+    static const char* C_ANON = "\033[32m";
+    static const char* C_FILE = "\033[33m";
+    static const char* C_OTHR = "\033[34m";
+    if (t_in_used <= anon_frac + 1e-9) return C_ANON;
+    if (t_in_used <= anon_frac + file_frac + 1e-9) return C_FILE;
+    return C_OTHR;
+}
 
-    // Precompute per-column levels in [0, H*5]
-    std::vector<int> col_levels(g_opt.graph_width, 0);
-    int pad = g_opt.graph_width - (int)dq.size();
+// ---------------- 2D graph printer ----------------
+// x=time (left→right), y is normalized 0..1 of TOTAL (internally H*5 steps).
+// Coloring now uses each column's own used% and anon/file fractions recorded at sampling time.
+static void print_graph2d_for_node(int n, int H, const NodeStat& s_latest, const std::deque<HistSample>& hist) {
+    // Build per-column absolute "used steps" from stored used_pct
+    const int steps_total = H * 5;
+    std::vector<int> used_steps(g_opt.graph_width, 0);
+    std::vector<double> anon_frac(g_opt.graph_width, 0.0);
+    std::vector<double> file_frac(g_opt.graph_width, 0.0);
+
+    int pad = g_opt.graph_width - (int)hist.size();
     if (pad < 0) pad = 0;
 
-    auto pct_at = [&](int col)->double{
-        if (col < 0) return 0.0;
-        if (col < pad) return 0.0;
-        size_t idx = (size_t)(col - pad);
-        if (idx < dq.size()) return dq[idx];
-        return 0.0;
-    };
-    auto lvl = [&](double pct)->int{
-        int L = (int)((pct/100.0) * (H*5) + 0.5);
-        if (L < 0) L = 0; if (L > H*5) L = H*5;
-        return L;
-    };
+    auto clampi = [&](int v, int lo, int hi){ return std::max(lo, std::min(hi, v)); };
 
     for (int x = 0; x < g_opt.graph_width; ++x) {
-        col_levels[x] = lvl(pct_at(x));
+        if (x < pad) {
+            used_steps[x] = 0;
+            anon_frac[x] = file_frac[x] = 0.0;
+        } else {
+            const HistSample& hs = hist[x - pad];
+            double u = std::max(0.0, std::min(100.0, hs.used_pct)) / 100.0; // used fraction of total
+            int steps = (int)std::round(u * steps_total);
+            used_steps[x] = clampi(steps, 0, steps_total);
+            anon_frac[x]  = std::max(0.0, std::min(1.0, hs.anon_frac_used));
+            file_frac[x]  = std::max(0.0, std::min(1.0, hs.file_frac_used));
+            if (anon_frac[x] + file_frac[x] > 1.0) {
+                // tiny numeric guard
+                double sum = anon_frac[x] + file_frac[x];
+                anon_frac[x] /= sum;
+                file_frac[x] /= sum;
+            }
+        }
     }
 
-    // Header with percent, height, total, used, free
+    // Header
     std::cout << "Node " << n
-              << "  (" << std::fixed << std::setprecision(1) << (dq.empty()?0.0:dq.back()) << "%, "
+              << "  (" << std::fixed << std::setprecision(1) << s_latest.used_pct << "%, "
               << "H=" << H << ", "
               << "Total=" << std::fixed << std::setprecision(2) << toGB(s_latest.total) << " GB, "
               << "Used="  << std::fixed << std::setprecision(2) << toGB(s_latest.used)  << " GB, "
               << "Free="  << std::fixed << std::setprecision(2) << toGB(s_latest.free)  << " GB"
               << ")\n";
 
-    // Precompute Y labels (top/mid/bottom) in GB for this node
+    // Y labels (in GB for the latest total)
     double total_gb = toGB(s_latest.total);
     double mid_gb   = total_gb / 2.0;
 
@@ -285,40 +314,44 @@ static void print_graph2d_for_node(int n, int H, const NodeStat& s_latest) {
         else if (row==0)   std::cout << y_label(0.0);
         else               std::cout << "         | ";
 
-        auto cell_fill = [&](int L)->int{
-            // how much of this row's 5 sub-steps are filled (0..5)
+        auto cell_fill = [&](int used_steps_col)->int{
+            // For this row, how many sub-steps are covered by "used" (0..5)
             int base = row * 5;
-            int rem  = L - base;
+            int rem  = used_steps_col - base;
             if (rem < 0) rem = 0;
             if (rem > 5) rem = 5;
             return rem;
         };
         auto step4 = [](int f)->int{
-            // map 0..5 -> 0..4 (5 collapses to 4)
             if (f <= 0) return 0;
             if (f >= 5) return 4;
             return f; // 1..4
         };
 
         for (int x = 0; x < g_opt.graph_width; ++x) {
-            int Lc = col_levels[x];
-            int Lp = (x>0) ? col_levels[x-1] : col_levels[x]; // first col: prev=curr
+            int uc = used_steps[x];
+            int up = (x>0) ? used_steps[x-1] : used_steps[x];
 
-            int fc = cell_fill(Lc);
-            int fp = cell_fill(Lp);
+            int fc = cell_fill(uc);
+            int fp = cell_fill(up);
 
             int sc = step4(fc);
             int sp = step4(fp);
-
             const char* sym = pick_symbol_up(sp, sc);
 
-            if (g_opt.use_color) {
-                double pct_curr = (double)Lc / (double)(H*5) * 100.0;
-                std::string col = color_for_usage(pct_curr, true);
-                std::cout << col << sym << "\033[0m";
-            } else {
-                std::cout << sym;
+            if (sc == 0) { // nothing in this cell
+                std::cout << sym; // likely ' '
+                continue;
             }
+
+            // Position inside USED for this column (0..1), based on the top of the cell
+            int level_steps = row*5 + std::min(fc, 5); // 1..5 in this row
+            double t_in_used = (uc > 0) ? (double)level_steps / (double)uc : 0.0;
+            if (t_in_used < 0.0) t_in_used = 0.0;
+            if (t_in_used > 1.0) t_in_used = 1.0;
+
+            const char* col = color_anon_file_other_by_ratio(t_in_used, anon_frac[x], file_frac[x], g_opt.use_color);
+            std::cout << col << sym << CLR_RESET(g_opt.use_color);
         }
         std::cout << "\n";
     }
@@ -334,7 +367,11 @@ static void print_graph2d(const std::vector<int>& nodes,
               << (g_opt.scale_by_total ? "  [scaled by total]" : "")
               << "\n";
     if (g_opt.graph_legend) {
-        std::cout << "Legend: ⣿=full, ⣾/⣼/⣸/⢸ partial; bottom-stacked; UP table only; y=memory (GB), x=time\n\n";
+        std::cout << "Legend (colors bottom→top within USED at each time column): "
+                  << "\033[32mAnon\033[0m, "
+                  << "\033[33mFilePages\033[0m, "
+                  << "\033[34mOther\033[0m"
+                  << "   y=memory (GB labels from latest), x=time\n\n";
     }
 
     long long max_total = 0;
@@ -349,7 +386,9 @@ static void print_graph2d(const std::vector<int>& nodes,
         auto it = latest_by_node.find(n);
         if (it == latest_by_node.end()) continue;
         int H = effective_height_for_node(it->second.total, max_total);
-        print_graph2d_for_node(n, H, it->second);
+        auto hit = g_hist.find(n);
+        if (hit == g_hist.end()) continue;
+        print_graph2d_for_node(n, H, it->second, hit->second);
     }
 
     if (g_opt.top_mode) std::cout << "(Press Ctrl+C to exit)\n";
@@ -357,9 +396,9 @@ static void print_graph2d(const std::vector<int>& nodes,
 }
 
 // ---------------- argp ----------------
-const char *argp_program_version = "numa_mem_monitor 1.7";
+const char *argp_program_version = "numa_mem_monitor 1.9";
 const char *argp_program_bug_address = "<bugs@example.com>";
-static char doc[] = "Per-NUMA node memory usage monitor (libnuma, GNU argp) with 2D Unicode graph (UP-table only), per-node scaled height, and headers incl. Total/Used/Free; y-axis in GB";
+static char doc[] = "Per-NUMA node memory usage monitor (libnuma, GNU argp) with 2D Unicode graph; per-node scaled height; headers with Total/Used/Free; y-axis in GB; FIXED coloring: each time column keeps its own Anon/File/Other split";
 static char args_doc[] = "";
 
 enum {
@@ -390,7 +429,7 @@ static struct argp_option options[] = {
     {"top",      KEY_TOP,      0,     0, "Full-screen refresh mode (default)"},
     {"no-top",   KEY_NO_TOP,   0,     0, "Append mode (no screen clear)"},
     // 2D graph options
-    {"graph2d",        KEY_GRAPH2D,       0,   0, "Enable 2D graph mode (x=time, y=usage)"},
+    {"graph2d",        KEY_GRAPH2D,       0,   0, "Enable 2D graph mode (x=time, y=GB)"},
     {"graph-width",    KEY_GRAPH_WIDTH,  "N",  0, "Graph width (columns, default 80)"},
     {"graph-height",   KEY_GRAPH_HEIGHT, "N",  0, "Graph base height (rows for largest node, default 10)"},
     {"scale-by-total", KEY_SCALE_BY_TOTAL,0,   0, "Scale each node's height by its total memory"},
@@ -456,16 +495,44 @@ int main(int argc, char** argv) {
     }
 
     do {
-        // Snapshot
-        auto stats = snapshot_nodes(nodes, /*details*/ g_opt.details && !g_opt.graph2d);
+        // Snapshot (need details in graph2d to compute fractions)
+        bool need_details = g_opt.details || g_opt.graph2d;
+        auto stats = snapshot_nodes(nodes, /*details*/ need_details);
         sort_stats(stats, g_opt.sort_key);
 
-        // Update history and build latest-by-node map for printing headers
+        // Update history from this snapshot
         std::map<int, NodeStat> latest_by_node;
         for (const auto& s : stats) {
             latest_by_node[s.node] = s;
+
+            // compute anon/file fractions INSIDE used for this snapshot
+            double used_gb = toGB(s.used);
+            double anon_gb = 0.0, file_gb = 0.0;
+            if (need_details) {
+                NodeExtra ex = s.extra;
+                if (ex.anon_bytes < 0 || ex.file_bytes < 0)
+                    (void)read_node_meminfo(s.node, ex);
+                anon_gb = (ex.anon_bytes >= 0) ? toGB(ex.anon_bytes) : 0.0;
+                file_gb = (ex.file_bytes >= 0) ? toGB(ex.file_bytes) : 0.0;
+            }
+            // clamp to used
+            if (anon_gb < 0) anon_gb = 0;
+            if (file_gb < 0) file_gb = 0;
+            if (anon_gb > used_gb) anon_gb = used_gb;
+            if (file_gb > std::max(0.0, used_gb - anon_gb))
+                file_gb = std::max(0.0, used_gb - anon_gb);
+
+            HistSample hs;
+            hs.used_pct = s.used_pct;
+            if (used_gb > 0) {
+                hs.anon_frac_used = anon_gb / used_gb;
+                hs.file_frac_used = file_gb / used_gb;
+            } else {
+                hs.anon_frac_used = hs.file_frac_used = 0.0;
+            }
+
             auto &dq = g_hist[s.node];
-            dq.push_back(s.used_pct);
+            dq.push_back(hs);
             if ((int)dq.size() > g_opt.graph_width) dq.pop_front();
         }
 
