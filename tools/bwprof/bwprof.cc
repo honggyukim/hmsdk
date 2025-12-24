@@ -798,7 +798,7 @@ class EventProcessor {
 
     void processCXLPorts(size_t num_ports, const pcm::ServerUncoreCounterState &prev_state,
                          const pcm::ServerUncoreCounterState &curr_state, SocketMemoryData &data) {
-        for (size_t p = 4; p < num_ports; ++p) {
+        for (size_t p = 0; p < num_ports; ++p) {
             data.cxl_reads += pcm::getCXLCMCounter(p, pcm::PCM::EventPosition::CXL_RxC_MEM,
                                                    prev_state, curr_state);
             data.cxl_writes += pcm::getCXLDPCounter(p, pcm::PCM::EventPosition::CXL_TxC_MEM,
