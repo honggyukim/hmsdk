@@ -51,10 +51,10 @@ def get_node_to_package_map(lstopo_file):
         sys.exit(-1)
     nodes = {}
 
-    rp = re.compile("^  Package P#(\d+)")
-    rn = re.compile("^    NUMANode P#(\d+)")
-    rn2 = re.compile("^      NUMANode P#(\d+)")
-    rmon = re.compile("^  NUMANode P#(\d+)")  # memory only node
+    rp = re.compile(r"^  Package P#(\d+)")
+    rn = re.compile(r"^    NUMANode P#(\d+)")
+    rn2 = re.compile(r"^      NUMANode P#(\d+)")
+    rmon = re.compile(r"^  NUMANode P#(\d+)")  # memory only node
 
     current_package = None
     for line in lines:
@@ -97,7 +97,7 @@ def topology_to_pydata(topology):
     assert topology[0:2] == "[["
     assert topology[-2:] == "]]"
 
-    rn = re.compile("^(\d+)")
+    rn = re.compile(r"^(\d+)")
     pytopo = []
     i = 1
     nested = False
