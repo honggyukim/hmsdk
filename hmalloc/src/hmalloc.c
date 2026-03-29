@@ -73,6 +73,8 @@ void update_env(void) {
     use_jemalloc = getenv_jemalloc();
     nodemask = getenv_nodemask();
     mpol_mode = getenv_mpol_mode();
+    if (nodemask > 0)
+        maxnode = numa_max_node() + 2;
 }
 
 __attribute__((constructor)) void hmalloc_init(void) {
@@ -97,7 +99,7 @@ void *hmalloc(size_t size) {
         return malloc(size);
 
     ptr = mallocx(size, MALLOCX_ARENA(arena_index) | MALLOCX_TCACHE_NONE);
-    if (errno == ENOMEM)
+    if (ptr == NULL)
         return NULL;
     return ptr;
 }
@@ -113,10 +115,16 @@ void hfree(void *ptr) {
 }
 
 void *hcalloc(size_t nmemb, size_t size) {
-    void *ptr = hmalloc(nmemb * size);
+    size_t total;
+    if (nmemb && size > SIZE_MAX / nmemb) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    total = nmemb * size;
+    void *ptr = hmalloc(total);
 
     if (likely(ptr))
-        memset(ptr, 0, nmemb * size);
+        memset(ptr, 0, total);
     return ptr;
 }
 

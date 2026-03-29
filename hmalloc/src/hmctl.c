@@ -70,19 +70,19 @@ static error_t parse_option(int key, char *arg, struct argp_state *state) {
     switch (key) {
     case 'm':
         opts->membind = arg;
-        if (opts->preferred > 0)
+        if (opts->preferred >= 0 || opts->preferred_many)
             fail_mpol_conflict(state, key);
         break;
 
     case 'P':
         opts->preferred_many = arg;
-        if (opts->membind)
+        if (opts->membind || opts->preferred >= 0)
             fail_mpol_conflict(state, key);
         break;
 
     case 'p':
         opts->preferred = atoi(arg);
-        if (opts->membind)
+        if (opts->membind || opts->preferred_many)
             fail_mpol_conflict(state, key);
         break;
 
@@ -134,6 +134,7 @@ static void setup_child_environ(struct opts *opts) {
         if (bm) {
             snprintf(buf, sizeof(buf), "%lu", *bm->maskp);
             setenv("HMALLOC_NODEMASK", buf, 1);
+            numa_free_nodemask(bm);
         }
     } else if (opts->preferred_many) {
         snprintf(buf, sizeof(buf), "%d", MPOL_PREFERRED_MANY);
@@ -143,6 +144,7 @@ static void setup_child_environ(struct opts *opts) {
         if (bm) {
             snprintf(buf, sizeof(buf), "%lu", *bm->maskp);
             setenv("HMALLOC_NODEMASK", buf, 1);
+            numa_free_nodemask(bm);
         }
     } else if (opts->preferred >= 0) {
         /* ignore when --membind is used */
@@ -160,6 +162,7 @@ static void setup_child_environ(struct opts *opts) {
         if (bm) {
             snprintf(buf, sizeof(buf), "%lu", *bm->maskp);
             setenv("HMALLOC_NODEMASK", buf, 1);
+            numa_free_nodemask(bm);
         }
     } else if (opts->interleave) {
         snprintf(buf, sizeof(buf), "%d", MPOL_INTERLEAVE);
@@ -169,6 +172,7 @@ static void setup_child_environ(struct opts *opts) {
         if (bm) {
             snprintf(buf, sizeof(buf), "%lu", *bm->maskp);
             setenv("HMALLOC_NODEMASK", buf, 1);
+            numa_free_nodemask(bm);
         }
     }
 
